@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "crypto-portfolio-tracker"
-version = "0.1.0"
-description = "Crypto portfolio PnL tracker with cost basis (average and realized/unrealized) — by Viprasol Tech."
+version = "0.2.0"
+description = "Crypto portfolio tracker: FIFO/LIFO/average cost basis, tax-lot reports, allocation & rebalancing, TWR/drawdown, CSV import/export — by Viprasol Tech."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

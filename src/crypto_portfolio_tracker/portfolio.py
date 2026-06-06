@@ -1,18 +1,21 @@
-"""Portfolio with average-cost-basis PnL accounting.
+"""Portfolio with pluggable cost-basis PnL accounting.
 
-The :class:`Portfolio` records buy/sell transactions per asset, maintains a
-running *average* cost basis, computes *realized* PnL when units are sold and
-*unrealized* PnL against a set of current mark prices.
+The :class:`Portfolio` records buy/sell transactions per asset, maintains cost
+basis under a chosen :class:`~crypto_portfolio_tracker.models.CostBasisMethod`
+(``AVERAGE``, ``FIFO`` or ``LIFO``), computes *realized* PnL when units are sold
+and *unrealized* PnL against a set of current mark prices.
 
-Accounting model (average cost basis):
+Accounting model:
 
-* A **buy** of ``q`` units at price ``p`` with fee ``f`` increases the held
-  quantity by ``q`` and the total cost basis by ``q * p + f``. The average cost
-  is the new total cost basis divided by the new quantity.
-* A **sell** of ``q`` units leaves the average cost unchanged. It reduces the
-  quantity by ``q`` and the cost basis by ``q * avg_cost``. Realized PnL for the
-  sell is ``q * sell_price - q * avg_cost - fee``.
-* Selling more than is held raises :class:`ValueError`.
+* **Average** — a buy of ``q`` units at price ``p`` with fee ``f`` increases the
+  held quantity by ``q`` and the total cost basis by ``q * p + f``; the average
+  cost is the new total cost basis over the new quantity. A sell leaves the
+  average cost unchanged and books ``q * sell_price - q * avg_cost - fee``.
+* **FIFO / LIFO** — buys create discrete lots; sells consume open lots in
+  first-in or last-in order and emit per-lot :class:`RealizedSale` rows suitable
+  for a tax-lot report.
+
+Selling more than is held raises :class:`ValueError` under every method.
 
 Part of Crypto Portfolio Tracker by Viprasol Tech Private Limited (https://viprasol.com).
 """
@@ -22,11 +25,20 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from crypto_portfolio_tracker.models import Position, Side, Transaction
+from crypto_portfolio_tracker.lots import LotBook
+from crypto_portfolio_tracker.models import (
+    CostBasisMethod,
+    Position,
+    RealizedSale,
+    Side,
+    Transaction,
+)
+
+_EPS = 1e-12
 
 
 @dataclass(slots=True)
-class _Lot:
+class _AvgLot:
     """Internal mutable per-asset accumulator (average cost basis)."""
 
     quantity: float = 0.0
@@ -41,7 +53,10 @@ class _Lot:
 
 @dataclass(slots=True)
 class Portfolio:
-    """Track holdings and PnL across multiple assets using average cost basis.
+    """Track holdings and PnL across multiple assets.
+
+    Args:
+        method: Cost-basis method to use for all assets. Defaults to ``AVERAGE``.
 
     Example:
         >>> pf = Portfolio()
@@ -53,11 +68,41 @@ class Portfolio:
         15000.0
     """
 
-    _lots: dict[str, _Lot] = field(default_factory=dict)
+    method: CostBasisMethod = CostBasisMethod.AVERAGE
+    _avg_lots: dict[str, _AvgLot] = field(default_factory=dict)
+    _lot_books: dict[str, LotBook] = field(default_factory=dict)
     transactions: list[Transaction] = field(default_factory=list)
+    realized_sales: list[RealizedSale] = field(default_factory=list)
 
-    def _lot(self, asset: str) -> _Lot:
-        return self._lots.setdefault(asset, _Lot())
+    @classmethod
+    def from_transactions(
+        cls,
+        transactions: list[Transaction],
+        method: CostBasisMethod = CostBasisMethod.AVERAGE,
+    ) -> Portfolio:
+        """Build a portfolio by replaying ``transactions`` in order.
+
+        Args:
+            transactions: Transactions to apply, oldest first.
+            method: Cost-basis method to use.
+
+        Returns:
+            A populated :class:`Portfolio`.
+        """
+        pf = cls(method=method)
+        for txn in transactions:
+            pf.record(txn)
+        return pf
+
+    # -- internal lookups ------------------------------------------------
+
+    def _avg(self, asset: str) -> _AvgLot:
+        return self._avg_lots.setdefault(asset, _AvgLot())
+
+    def _book(self, asset: str) -> LotBook:
+        return self._lot_books.setdefault(asset, LotBook(self.method))
+
+    # -- recording -------------------------------------------------------
 
     def record(self, txn: Transaction) -> float:
         """Apply a transaction and return realized PnL (0.0 for buys).
@@ -79,15 +124,21 @@ class Portfolio:
         if txn.fee < 0:
             raise ValueError("fee must be non-negative")
 
-        lot = self._lot(txn.asset)
+        if self.method is CostBasisMethod.AVERAGE:
+            realized = self._record_average(txn)
+        else:
+            realized = self._record_lots(txn)
+        self.transactions.append(txn)
+        return realized
+
+    def _record_average(self, txn: Transaction) -> float:
+        lot = self._avg(txn.asset)
         if txn.side is Side.BUY:
             lot.quantity += txn.quantity
             lot.cost_basis += txn.quantity * txn.price + txn.fee
-            self.transactions.append(txn)
             return 0.0
 
-        # Sell.
-        if txn.quantity > lot.quantity + 1e-12:
+        if txn.quantity > lot.quantity + _EPS:
             raise ValueError(f"cannot sell {txn.quantity} {txn.asset}: only {lot.quantity} held")
         avg_cost = lot.avg_cost
         proceeds = txn.quantity * txn.price - txn.fee
@@ -95,106 +146,158 @@ class Portfolio:
         realized = proceeds - cost_removed
         lot.quantity -= txn.quantity
         lot.cost_basis -= cost_removed
-        if lot.quantity <= 1e-12:
-            # Avoid leaving a tiny residual cost basis from float error.
+        if lot.quantity <= _EPS:
             lot.quantity = 0.0
             lot.cost_basis = 0.0
         lot.realized_pnl += realized
-        self.transactions.append(txn)
+        self.realized_sales.append(
+            RealizedSale(
+                asset=txn.asset,
+                quantity=txn.quantity,
+                proceeds=proceeds,
+                cost_basis=cost_removed,
+                acquired=None,
+                disposed=txn.timestamp,
+            )
+        )
         return realized
 
-    def buy(self, asset: str, quantity: float, price: float, fee: float = 0.0) -> None:
-        """Record a buy of ``quantity`` units of ``asset`` at ``price``.
+    def _record_lots(self, txn: Transaction) -> float:
+        book = self._book(txn.asset)
+        if txn.side is Side.BUY:
+            book.add_buy(txn.quantity, txn.price, txn.fee, txn.timestamp)
+            return 0.0
 
-        Args:
-            asset: Ticker symbol.
-            quantity: Units bought (must be positive).
-            price: Price per unit in the quote currency.
-            fee: Flat fee in the quote currency.
-        """
-        self.record(Transaction(asset, Side.BUY, quantity, price, fee))
+        try:
+            sales = book.add_sell(txn.quantity, txn.price, txn.fee, txn.timestamp)
+        except ValueError as exc:
+            raise ValueError(f"cannot sell {txn.quantity} {txn.asset}: {exc}") from exc
+        realized = 0.0
+        for sale in sales:
+            stamped = RealizedSale(
+                asset=txn.asset,
+                quantity=sale.quantity,
+                proceeds=sale.proceeds,
+                cost_basis=sale.cost_basis,
+                acquired=sale.acquired,
+                disposed=sale.disposed,
+            )
+            self.realized_sales.append(stamped)
+            realized += stamped.gain
+        return realized
 
-    def sell(self, asset: str, quantity: float, price: float, fee: float = 0.0) -> float:
-        """Record a sell and return the realized PnL booked.
+    def buy(
+        self,
+        asset: str,
+        quantity: float,
+        price: float,
+        fee: float = 0.0,
+        timestamp: object = None,
+    ) -> None:
+        """Record a buy of ``quantity`` units of ``asset`` at ``price``."""
+        from datetime import datetime
 
-        Args:
-            asset: Ticker symbol.
-            quantity: Units sold (must be positive and <= units held).
-            price: Price per unit in the quote currency.
-            fee: Flat fee in the quote currency.
+        ts = timestamp if isinstance(timestamp, datetime) else None
+        self.record(Transaction(asset, Side.BUY, quantity, price, fee, ts))
 
-        Returns:
-            Realized PnL for this sell.
+    def sell(
+        self,
+        asset: str,
+        quantity: float,
+        price: float,
+        fee: float = 0.0,
+        timestamp: object = None,
+    ) -> float:
+        """Record a sell and return the realized PnL booked."""
+        from datetime import datetime
 
-        Raises:
-            ValueError: If selling more than is held.
-        """
-        return self.record(Transaction(asset, Side.SELL, quantity, price, fee))
+        ts = timestamp if isinstance(timestamp, datetime) else None
+        return self.record(Transaction(asset, Side.SELL, quantity, price, fee, ts))
+
+    # -- snapshots -------------------------------------------------------
+
+    def _qty_cost(self, asset: str) -> tuple[float, float, float]:
+        """Return ``(quantity, cost_basis, realized_pnl)`` for an asset."""
+        if self.method is CostBasisMethod.AVERAGE:
+            lot = self._avg_lots.get(asset)
+            if lot is None:
+                return 0.0, 0.0, 0.0
+            return lot.quantity, lot.cost_basis, lot.realized_pnl
+        book = self._lot_books.get(asset)
+        if book is None:
+            return 0.0, 0.0, 0.0
+        return book.quantity, book.cost_basis, book.realized_pnl
 
     def position(self, asset: str) -> Position:
-        """Return the current :class:`Position` snapshot for ``asset``.
-
-        Args:
-            asset: Ticker symbol.
-
-        Returns:
-            A :class:`Position` (zeroed if the asset was never traded).
-        """
-        lot = self._lots.get(asset, _Lot())
+        """Return the current :class:`Position` snapshot for ``asset``."""
+        quantity, cost_basis, realized = self._qty_cost(asset)
+        avg_cost = cost_basis / quantity if quantity > _EPS else 0.0
         return Position(
             asset=asset,
-            quantity=lot.quantity,
-            avg_cost=lot.avg_cost,
-            cost_basis=lot.cost_basis,
-            realized_pnl=lot.realized_pnl,
+            quantity=quantity,
+            avg_cost=avg_cost,
+            cost_basis=cost_basis,
+            realized_pnl=realized,
         )
+
+    def assets(self) -> list[str]:
+        """Return every asset ever traded, sorted alphabetically."""
+        keys = set(self._avg_lots) | set(self._lot_books)
+        return sorted(keys)
 
     def holdings(self) -> dict[str, float]:
         """Return a mapping of asset -> quantity for assets currently held.
 
-        Returns:
-            Only assets with a strictly positive quantity are included.
+        Only assets with a strictly positive quantity are included.
         """
-        return {a: lot.quantity for a, lot in self._lots.items() if lot.quantity > 0}
+        result: dict[str, float] = {}
+        for asset in self.assets():
+            qty, _, _ = self._qty_cost(asset)
+            if qty > _EPS:
+                result[asset] = qty
+        return result
 
     def realized_pnl(self) -> float:
         """Return the total realized PnL across all assets."""
-        return sum(lot.realized_pnl for lot in self._lots.values())
+        if self.method is CostBasisMethod.AVERAGE:
+            return sum(lot.realized_pnl for lot in self._avg_lots.values())
+        return sum(book.realized_pnl for book in self._lot_books.values())
+
+    def tax_lot_report(self) -> list[RealizedSale]:
+        """Return every realized disposal recorded so far (a tax-lot report).
+
+        For FIFO/LIFO there is one row per consumed lot, carrying acquisition and
+        disposal timestamps and holding-period classification. For AVERAGE there
+        is one row per sell with no acquisition date.
+        """
+        return list(self.realized_sales)
 
     def unrealized_pnl(self, prices: Mapping[str, float]) -> float:
         """Return total unrealized PnL of open positions given ``prices``.
 
-        Args:
-            prices: Mapping of asset -> current mark price. Assets missing from
-                the mapping are valued at their cost basis (contribute ``0.0``).
-
-        Returns:
-            Sum of per-asset unrealized PnL.
+        Assets missing from ``prices`` contribute ``0.0``.
         """
         total = 0.0
-        for asset, lot in self._lots.items():
-            if lot.quantity <= 0:
+        for asset in self.assets():
+            qty, cost_basis, _ = self._qty_cost(asset)
+            if qty <= _EPS:
                 continue
             mark = prices.get(asset)
             if mark is None:
                 continue
-            total += lot.quantity * mark - lot.cost_basis
+            total += qty * mark - cost_basis
         return total
 
     def total_value(self, prices: Mapping[str, float]) -> float:
         """Return the market value of all open positions given ``prices``.
 
-        Args:
-            prices: Mapping of asset -> current mark price. Held assets missing a
-                price are valued at their cost basis.
-
-        Returns:
-            Total market value of the portfolio.
+        Held assets missing a price are valued at their cost basis.
         """
         total = 0.0
-        for asset, lot in self._lots.items():
-            if lot.quantity <= 0:
+        for asset in self.assets():
+            qty, cost_basis, _ = self._qty_cost(asset)
+            if qty <= _EPS:
                 continue
             mark = prices.get(asset)
-            total += lot.quantity * mark if mark is not None else lot.cost_basis
+            total += qty * mark if mark is not None else cost_basis
         return total
