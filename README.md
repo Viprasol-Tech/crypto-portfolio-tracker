@@ -77,7 +77,7 @@ pf.buy("BTC", 1.0, 20_000.0, timestamp=datetime(2023, 1, 1))
 pf.buy("BTC", 1.0, 30_000.0, timestamp=datetime(2024, 3, 1))
 
 realized = pf.sell("BTC", 1.0, 40_000.0, timestamp=datetime(2025, 6, 1))
-print(realized)                       # 20,000 — FIFO consumes the 20k lot first
+print(realized)  # 20,000 — FIFO consumes the 20k lot first
 
 # Tax-lot report: one row per matched disposal.
 for sale in pf.tax_lot_report():
@@ -86,9 +86,9 @@ for sale in pf.tax_lot_report():
 pf.buy("ETH", 10.0, 1_500.0)
 prices = {"BTC": 45_000.0, "ETH": 2_000.0}
 
-print(allocation(pf, prices))                              # weights per asset
-print(rebalance(pf, prices, {"BTC": 0.5, "ETH": 0.5}))     # trades to 50/50
-print(performance([100.0, 120.0, 90.0, 110.0]))            # TWR + max drawdown
+print(allocation(pf, prices))  # weights per asset
+print(rebalance(pf, prices, {"BTC": 0.5, "ETH": 0.5}))  # trades to 50/50
+print(performance([100.0, 120.0, 90.0, 110.0]))  # TWR + max drawdown
 ```
 
 ## 🏗️ Architecture
